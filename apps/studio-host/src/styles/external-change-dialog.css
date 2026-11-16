@@ -1,0 +1,36 @@
+.external-change-dialog {
+  max-width: calc(100vw - 32px);
+}
+
+.external-change-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+}
+
+.external-change-message {
+  margin: 0;
+  color: var(--color-text);
+  font-size: var(--font-size-base);
+  line-height: 1.5;
+}
+
+.external-change-path {
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--color-bg-subtle, rgba(128, 128, 128, 0.1));
+  color: var(--color-text-secondary, var(--color-text));
+  font-size: var(--font-size-sm);
+  word-break: break-all;
+}
+
+.external-change-footer {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.external-change-btn-danger {
+  color: #b91c1c;
+}

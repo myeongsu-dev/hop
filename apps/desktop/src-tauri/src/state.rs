@@ -60,9 +60,9 @@ pub struct ExternalModificationStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileFingerprint {
-    len: u64,
-    modified_millis: u64,
-    content_hash: u32,
+    pub(crate) len: u64,
+    pub(crate) modified_millis: u64,
+    pub(crate) content_hash: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +110,7 @@ pub struct AppState {
     pub(crate) pending_open_paths: PendingOpenPaths,
     pub quit_requests: Mutex<crate::app_quit::AppQuitState>,
     pub updater: Mutex<crate::updates::UpdateManagerState>,
+    pub file_watcher: crate::file_watch::FileWatcherManager,
 }
 
 impl DocumentSessionManager {
@@ -424,6 +425,12 @@ impl DocumentSessionManager {
             .get_mut(doc_id)
             .ok_or_else(|| format!("문서 세션을 찾을 수 없습니다: {}", doc_id))
     }
+
+    pub(crate) fn source_info(&self, doc_id: &str) -> Option<(PathBuf, Option<FileFingerprint>)> {
+        let session = self.sessions.get(doc_id)?;
+        let path = session.source_path.clone()?;
+        Some((path, session.source_fingerprint.clone()))
+    }
 }
 
 impl DocumentSession {
@@ -640,7 +647,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
+pub(crate) fn file_fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
     let metadata = std::fs::metadata(path)?;
     let mut file = std::fs::File::open(path)?;
     file_fingerprint_from_metadata(metadata, hash_reader(&mut file)?)
@@ -698,7 +705,7 @@ fn fnv1a32_update(mut hash: u32, bytes: &[u8]) -> u32 {
     hash
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }

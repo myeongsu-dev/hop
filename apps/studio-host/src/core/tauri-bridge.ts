@@ -4,6 +4,7 @@ import { remove, stat } from '@tauri-apps/plugin-fs';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { finiteFileSize, readFileInChunks, writeFileInChunks } from './chunked-fs';
 import { loadDocumentForOpen } from './document-open';
+import { openExternalChangeDialog, type ExternalChangeKind } from '../ui/external-change-dialog';
 
 type DocumentFormat = 'hwp' | 'hwpx';
 
@@ -66,14 +67,33 @@ export interface RecentDocument {
   fileName: string;
 }
 
+export interface ExternalFileChangedPayload {
+  docId: string;
+  path: string;
+  kind: ExternalChangeKind;
+}
+
 export interface DesktopLoadPayload {
   docInfo: DocumentInfo;
   message: string;
 }
 
+export interface DesktopBridgeListeners {
+  onDocumentLoaded?: (payload: DesktopLoadPayload) => void;
+  onDocumentSaved?: (result: DesktopSaveResult) => void;
+  onDocumentOperationSettled?: () => void;
+  onExternalFileDeleted?: (payload: ExternalFileChangedPayload) => void;
+  onStatus?: (message: string) => void;
+}
+
 export interface DesktopBridgeApi {
   openDocumentFromDialog(): Promise<DesktopLoadPayload | null>;
   openDocumentByPath(path: string): Promise<DesktopLoadPayload | null>;
+  handleExternalFileChanged?(payload: ExternalFileChangedPayload): Promise<DesktopLoadPayload | null>;
+  getCurrentDocId?(): string | null;
+  isDocumentOperationPending?(): boolean;
+  isExternalChangeInFlight?(): boolean;
+  setDesktopListeners?(listeners: DesktopBridgeListeners): void;
   takePendingOpenPaths(): Promise<string[]>;
   createNewDocumentAsync(): Promise<DesktopLoadPayload | null>;
   createNewWindow(): Promise<string>;
@@ -102,6 +122,25 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
   private revision = 0;
   private dirty = false;
   private documentOperationPending = false;
+  private externalChangeInFlight = false;
+  private pendingExternalChange: ExternalFileChangedPayload | null = null;
+  private desktopListeners: DesktopBridgeListeners | null = null;
+
+  getCurrentDocId(): string | null {
+    return this.docId;
+  }
+
+  isDocumentOperationPending(): boolean {
+    return this.documentOperationPending;
+  }
+
+  isExternalChangeInFlight(): boolean {
+    return this.externalChangeInFlight;
+  }
+
+  setDesktopListeners(listeners: DesktopBridgeListeners): void {
+    this.desktopListeners = listeners;
+  }
 
   async openDocumentFromDialog(): Promise<DesktopLoadPayload | null> {
     return this.withDocumentOperation(async () => {
@@ -120,7 +159,14 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
   }
 
   private async openDocumentPath(path: string): Promise<DesktopLoadPayload | null> {
-    if (!(await this.confirmReadyForDocumentReplacement())) return null;
+    return this.loadDocumentFromPath(path, { confirmReplacement: true });
+  }
+
+  private async loadDocumentFromPath(
+    path: string,
+    { confirmReplacement }: { confirmReplacement: boolean },
+  ): Promise<DesktopLoadPayload | null> {
+    if (confirmReplacement && !(await this.confirmReadyForDocumentReplacement())) return null;
 
     await this.invoke<void>('prepare_document_open', { path });
     const { bytes, sourceFingerprint } = await this.readFileForOpen(path);
@@ -136,6 +182,7 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
         return null;
       }
       this.applyNativeOpenResult(result, this.normalizedSourceFormat(super.getSourceFormat()));
+      await this.startFileWatch(result.docId, path);
       await this.noteFinderRecentDocument(path);
       await this.recordRecentDocument(path);
       await this.closeReplacedDocument(previousDocId, result.docId);
@@ -147,6 +194,78 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
       await this.closeNativeDocument(result.docId);
       throw error;
     }
+  }
+
+  async handleExternalFileChanged(
+    payload: ExternalFileChangedPayload,
+  ): Promise<DesktopLoadPayload | null> {
+    if (!this.docId || this.docId !== payload.docId) return null;
+    if (this.externalChangeInFlight || this.documentOperationPending) {
+      this.pendingExternalChange = payload;
+      return null;
+    }
+
+    this.externalChangeInFlight = true;
+    let result: DesktopLoadPayload | null = null;
+    try {
+      const decision = await openExternalChangeDialog({
+        fileName: this.fileName,
+        path: payload.path,
+        dirty: this.hasUnsavedChanges(),
+        kind: payload.kind,
+      });
+
+      if (this.docId === payload.docId) {
+        if (
+          decision === 'ignore' ||
+          decision === 'keep-mine' ||
+          decision === 'acknowledge-deleted'
+        ) {
+          await this.invoke<void>('acknowledge_external_change', {
+            docId: payload.docId,
+          }).catch(() => undefined);
+          result = null;
+        } else if (decision === 'reload' || decision === 'reload-discard') {
+          const targetPath = this.sourcePath ?? payload.path;
+          result = await this.withDocumentOperation(
+            () => this.loadDocumentFromPath(targetPath, { confirmReplacement: false }),
+            { allowDuringExternalChange: true },
+          );
+        } else {
+          const originalPath = this.sourcePath ?? payload.path;
+          result = await this.withDocumentOperation(async () => {
+            const saved = await this.saveDocumentAs();
+            if (!saved) return null;
+            this.desktopListeners?.onDocumentSaved?.(saved);
+            const savedPath = saved.sourcePath ?? '사본';
+            try {
+              const reloaded = await this.loadDocumentFromPath(originalPath, {
+                confirmReplacement: false,
+              });
+              if (!reloaded) {
+                this.desktopListeners?.onStatus?.(
+                  `사본은 저장됨 (${savedPath}), 원본 다시 불러오기가 취소되었습니다.`,
+                );
+              }
+              return reloaded;
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error);
+              throw new Error(`사본은 저장됨 (${savedPath}), 원본 다시 불러오기 실패: ${reason}`);
+            }
+          }, { allowDuringExternalChange: true });
+        }
+      }
+    } finally {
+      this.externalChangeInFlight = false;
+    }
+
+    const queued = this.pendingExternalChange;
+    this.pendingExternalChange = null;
+    if (queued && queued.docId === this.docId) {
+      const nextResult = await this.handleExternalFileChanged(queued);
+      return nextResult ?? result;
+    }
+    return result;
   }
 
   async takePendingOpenPaths(): Promise<string[]> {
@@ -301,7 +420,7 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
   }
 
   async confirmWindowClose(): Promise<boolean> {
-    if (this.documentOperationPending) return false;
+    if (this.documentOperationPending || this.externalChangeInFlight) return false;
     return this.withDocumentOperation(async () => {
       const canClose = await this.confirmReadyForDocumentReplacement();
       if (canClose) await this.releaseCurrentNativeDocument();
@@ -311,8 +430,14 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
 
   // A password or native dialog can stay open while Finder/menu events arrive.
   // Keep each document transaction exclusive; internal safety saves share its lock.
-  private async withDocumentOperation<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.documentOperationPending) {
+  private async withDocumentOperation<T>(
+    operation: () => Promise<T>,
+    options: { allowDuringExternalChange?: boolean } = {},
+  ): Promise<T> {
+    if (
+      this.documentOperationPending ||
+      (this.externalChangeInFlight && !options.allowDuringExternalChange)
+    ) {
       throw new Error('다른 문서 작업이 진행 중입니다. 현재 작업을 완료하거나 취소하세요.');
     }
     this.documentOperationPending = true;
@@ -320,12 +445,40 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
       return await operation();
     } finally {
       this.documentOperationPending = false;
+      this.desktopListeners?.onDocumentOperationSettled?.();
+      if (!this.externalChangeInFlight && this.pendingExternalChange) {
+        void this.flushPendingExternalChange();
+      }
+    }
+  }
+
+  private async flushPendingExternalChange(): Promise<void> {
+    if (this.externalChangeInFlight || this.documentOperationPending) return;
+    const queued = this.pendingExternalChange;
+    this.pendingExternalChange = null;
+    if (!queued || queued.docId !== this.docId) return;
+    try {
+      const loaded = await this.handleExternalFileChanged(queued);
+      if (loaded) {
+        this.desktopListeners?.onDocumentLoaded?.(loaded);
+      } else if (queued.kind === 'deleted' && this.docId === queued.docId) {
+        this.desktopListeners?.onExternalFileDeleted?.(queued);
+      }
+    } catch (error) {
+      this.desktopListeners?.onStatus?.(`외부 변경 처리 실패: ${error}`);
+      console.error('[TauriBridge] 보류된 외부 변경 처리 실패:', error);
     }
   }
 
   private async invoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke<T>(command, args);
+  }
+
+  private async startFileWatch(docId: string, path: string): Promise<void> {
+    await this.invoke<void>('start_file_watch', { docId, path }).catch((error: unknown) => {
+      console.warn('[TauriBridge] file watch start failed:', error);
+    });
   }
 
   private async closeNativeDocument(docId: string): Promise<void> {
@@ -403,6 +556,7 @@ export class TauriBridge extends WasmBridge implements DesktopBridgeApi {
       });
       this.applyNativeSaveResult(result);
       this.requiresPasswordForSave = false;
+      await this.startFileWatch(result.docId, finalPath);
       await this.noteFinderRecentDocument(finalPath);
       return result;
     } finally {

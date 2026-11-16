@@ -2,12 +2,22 @@ import type { CommandDispatcher } from '@/upstream/commands';
 import type { EventBus } from '@/upstream/core';
 import { isTauriRuntime } from '@/core/bridge-factory';
 import { findLatestSupportedDocumentPath, hasSupportedDocumentPath } from '@/core/document-files';
-import type { DesktopBridgeApi, DesktopLoadPayload, DesktopUpdateState } from './tauri-bridge';
+import type {
+  DesktopBridgeApi,
+  DesktopLoadPayload,
+  DesktopUpdateState,
+  ExternalFileChangedPayload,
+} from './tauri-bridge';
 
 type DesktopRuntimeBridge = Partial<
   Pick<
     DesktopBridgeApi,
     | 'openDocumentByPath'
+    | 'handleExternalFileChanged'
+    | 'getCurrentDocId'
+    | 'isDocumentOperationPending'
+    | 'isExternalChangeInFlight'
+    | 'setDesktopListeners'
     | 'takePendingOpenPaths'
     | 'createNewDocumentAsync'
     | 'confirmWindowClose'
@@ -53,9 +63,22 @@ export async function setupDesktopEvents({
     onUpdateState(event.payload as DesktopUpdateState);
   });
 
+  let deferredExternalChange: ExternalFileChangedPayload | null = null;
+  let processingExternalChange = false;
+
+  const hasWindowFocus = (): boolean =>
+    typeof document === 'undefined' ||
+    typeof document.hasFocus !== 'function' ||
+    document.hasFocus();
+
   await currentWindow.listen('hop-menu-command', (event) => {
     const command = String(event.payload || '');
-    if (command) dispatcher.dispatch(command);
+    if (!command) return;
+    if (processingExternalChange || desktop.isExternalChangeInFlight?.()) {
+      setMessage('외부 변경 확인 대화상자를 먼저 닫아주세요.');
+      return;
+    }
+    dispatcher.dispatch(command);
   });
 
   await currentWindow.listen('hop-app-quit-requested', async () => {
@@ -72,6 +95,85 @@ export async function setupDesktopEvents({
       setMessage,
     });
   });
+
+  const drainDeferredExternalChange = async (): Promise<void> => {
+    const queued = deferredExternalChange;
+    if (
+      !queued ||
+      processingExternalChange ||
+      desktop.isDocumentOperationPending?.() ||
+      !hasWindowFocus()
+    ) {
+      return;
+    }
+    deferredExternalChange = null;
+    await processExternalChange(queued);
+  };
+
+  const processExternalChange = async (payload: ExternalFileChangedPayload): Promise<void> => {
+    if (!desktop.handleExternalFileChanged) return;
+    if (processingExternalChange || desktop.isDocumentOperationPending?.()) {
+      deferredExternalChange = payload;
+      return;
+    }
+    processingExternalChange = true;
+    try {
+      const loaded = await desktop.handleExternalFileChanged(payload);
+      if (loaded) {
+        eventBus.emit('desktop-document-loaded', loaded);
+        setMessage(loaded.message);
+      } else if (
+        payload.kind === 'deleted' &&
+        (!desktop.getCurrentDocId || desktop.getCurrentDocId() === payload.docId)
+      ) {
+        setMessage('원본 파일이 외부에서 삭제되었거나 이동되었습니다');
+      }
+    } catch (error) {
+      setMessage(`외부 변경 처리 실패: ${error}`);
+      console.error('[desktop-events] 외부 변경 처리 실패:', error);
+    } finally {
+      processingExternalChange = false;
+      await drainDeferredExternalChange();
+    }
+  };
+
+  desktop.setDesktopListeners?.({
+    onDocumentLoaded: (loaded) => {
+      eventBus.emit('desktop-document-loaded', loaded);
+      setMessage(loaded.message);
+    },
+    onDocumentSaved: (saved) => {
+      eventBus.emit('desktop-document-saved', saved);
+    },
+    onDocumentOperationSettled: () => {
+      void drainDeferredExternalChange();
+    },
+    onExternalFileDeleted: (payload) => {
+      if (!desktop.getCurrentDocId || desktop.getCurrentDocId() === payload.docId) {
+        setMessage('원본 파일이 외부에서 삭제되었거나 이동되었습니다');
+      }
+    },
+    onStatus: (message) => {
+      setMessage(message);
+    },
+  });
+
+  await currentWindow.listen('hop-external-file-changed', async (event) => {
+    const payload = event.payload as ExternalFileChangedPayload;
+    if (!payload?.docId || !payload?.path) return;
+    if (!hasWindowFocus()) {
+      deferredExternalChange = payload;
+      setMessage('외부에서 파일이 변경되었습니다. 창을 선택하면 확인합니다.');
+      return;
+    }
+    await processExternalChange(payload);
+  });
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('focus', () => {
+      void drainDeferredExternalChange();
+    });
+  }
 
   await currentWindow.listen('tauri://drag-enter', (event) => {
     const payload = event.payload as { paths?: string[] };

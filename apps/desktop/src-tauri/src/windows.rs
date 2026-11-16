@@ -47,7 +47,6 @@ pub fn create_editor_window_with_label(app: &AppHandle, label: &str) -> Result<(
         .map_err(|e| format!("새 창 생성 실패: {}", e))?;
     install_editor_window_minimum_with_size(&window, geometry.min_width, geometry.min_height);
     configure_editor_webview(app, &window);
-    attach_pending_open_cleanup(app, &window);
     let _ = window.set_focus();
 
     Ok(())
@@ -172,31 +171,24 @@ pub fn configure_editor_webview(app: &AppHandle, window: &WebviewWindow) {
 
     let app = app.clone();
     let label = window.label().to_string();
-    window.on_window_event(move |event| {
-        let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event else {
-            return;
-        };
-        let paths = document_paths(paths);
-        if paths.is_empty() {
-            return;
+    window.on_window_event(move |event| match event {
+        WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
+            let paths = document_paths(paths);
+            if paths.is_empty() {
+                return;
+            }
+            let _ = app.emit_to(
+                label.as_str(),
+                "hop-open-paths",
+                serde_json::json!({ "paths": paths }),
+            );
         }
-        let _ = app.emit_to(
-            label.as_str(),
-            "hop-open-paths",
-            serde_json::json!({ "paths": paths }),
-        );
-    });
-}
-
-fn attach_pending_open_cleanup(app: &AppHandle, window: &WebviewWindow) {
-    let app = app.clone();
-    let label = window.label().to_string();
-    window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
-            app.state::<crate::state::AppState>()
-                .pending_open_paths
-                .discard_for_window(&label);
+        WindowEvent::Destroyed => {
+            let state = app.state::<crate::state::AppState>();
+            state.pending_open_paths.discard_for_window(&label);
+            state.file_watcher.unwatch_for_window(&label);
         }
+        _ => {}
     });
 }
 

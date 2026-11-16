@@ -69,6 +69,7 @@ pub fn prepare_document_open(app: AppHandle, path: String) -> Result<(), String>
 
 #[tauri::command]
 pub fn close_document(doc_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.file_watcher.unwatch(&doc_id);
     state
         .sessions
         .lock()
@@ -130,6 +131,7 @@ pub fn commit_staged_hwp_save(
             expected_revision,
             allow_external_overwrite.unwrap_or(false),
         )?;
+    state.file_watcher.reset_notified(&doc_id);
     let _ = recent_documents::record_document(&app, &target_path);
     Ok(result)
 }
@@ -193,6 +195,30 @@ pub fn check_external_modification(
         .lock()
         .map_err(|_| "문서 세션 잠금 실패".to_string())?
         .external_modification_status(&doc_id, target_path.map(PathBuf::from))
+}
+
+#[tauri::command]
+pub fn start_file_watch(
+    app: AppHandle,
+    window: WebviewWindow,
+    doc_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .file_watcher
+        .watch(app, window.label().to_string(), doc_id, PathBuf::from(path))
+}
+
+#[tauri::command]
+pub fn stop_file_watch(doc_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.file_watcher.unwatch(&doc_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn acknowledge_external_change(doc_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.file_watcher.acknowledge_change(&doc_id)
 }
 
 #[tauri::command]

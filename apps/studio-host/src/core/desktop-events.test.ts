@@ -317,6 +317,140 @@ describe('desktop events', () => {
       expect.any(Error),
     );
   });
+
+  it('emits desktop-document-loaded when external file change reloads immediately', async () => {
+    const { windowHandlers } = installTauriMocks();
+    (globalThis as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
+    installDocumentStub();
+
+    const loaded = { docInfo: { pageCount: 2 }, message: 'doc.hwp — 2페이지' };
+    const setMessage = vi.fn();
+    const eventBus = { emit: vi.fn() };
+    const bridge = {
+      takePendingOpenPaths: vi.fn().mockResolvedValue([]),
+      handleExternalFileChanged: vi.fn().mockResolvedValue(loaded),
+    };
+
+    await setupDesktopEvents({
+      bridge,
+      dispatcher: { dispatch: vi.fn() } as never,
+      eventBus: eventBus as never,
+      setMessage,
+      onUpdateState: vi.fn(),
+    });
+
+    await windowHandlers.get('hop-external-file-changed')?.({
+      payload: { docId: 'doc-1', path: 'C:\\docs\\doc.hwp', kind: 'modified' },
+    });
+
+    expect(bridge.handleExternalFileChanged).toHaveBeenCalledWith({
+      docId: 'doc-1',
+      path: 'C:\\docs\\doc.hwp',
+      kind: 'modified',
+    });
+    expect(eventBus.emit).toHaveBeenCalledWith('desktop-document-loaded', loaded);
+    expect(setMessage).toHaveBeenCalledWith('doc.hwp — 2페이지');
+  });
+
+  it('defers external file change dialog until background window gains focus', async () => {
+    const { windowHandlers } = installTauriMocks();
+    let focusHandler: (() => void) | undefined;
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {},
+      addEventListener: vi.fn((event: string, handler: () => void) => {
+        if (event === 'focus') focusHandler = handler;
+      }),
+    };
+    let focused = false;
+    (globalThis as { document?: unknown }).document = {
+      getElementById: vi.fn(() => ({ classList: { toggle: vi.fn() } })),
+      hasFocus: () => focused,
+    };
+
+    const setMessage = vi.fn();
+    const eventBus = { emit: vi.fn() };
+    const loaded = { docInfo: { pageCount: 1 }, message: 'reloaded' };
+    const bridge = {
+      takePendingOpenPaths: vi.fn().mockResolvedValue([]),
+      handleExternalFileChanged: vi.fn().mockResolvedValue(loaded),
+    };
+
+    await setupDesktopEvents({
+      bridge,
+      dispatcher: { dispatch: vi.fn() } as never,
+      eventBus: eventBus as never,
+      setMessage,
+      onUpdateState: vi.fn(),
+    });
+
+    await windowHandlers.get('hop-external-file-changed')?.({
+      payload: { docId: 'doc-1', path: 'C:\\docs\\doc.hwp', kind: 'modified' },
+    });
+
+    expect(bridge.handleExternalFileChanged).not.toHaveBeenCalled();
+    expect(setMessage).toHaveBeenCalledWith('외부에서 파일이 변경되었습니다. 창을 선택하면 확인합니다.');
+
+    focused = true;
+    focusHandler?.();
+    await vi.waitFor(() => {
+      expect(bridge.handleExternalFileChanged).toHaveBeenCalledTimes(1);
+    });
+    expect(eventBus.emit).toHaveBeenCalledWith('desktop-document-loaded', loaded);
+  });
+
+  it('coalesces concurrent external file change events and reports deleted files', async () => {
+    const { windowHandlers } = installTauriMocks();
+    (globalThis as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
+    installDocumentStub();
+
+    let resolveFirst!: (value: null) => void;
+    const setMessage = vi.fn();
+    const bridge = {
+      takePendingOpenPaths: vi.fn().mockResolvedValue([]),
+      handleExternalFileChanged: vi
+        .fn()
+        .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve; }))
+        .mockResolvedValueOnce(null),
+    };
+
+    await setupDesktopEvents({
+      bridge,
+      dispatcher: { dispatch: vi.fn() } as never,
+      eventBus: { emit: vi.fn() } as never,
+      setMessage,
+      onUpdateState: vi.fn(),
+    });
+
+    // Invalid payload is ignored
+    await windowHandlers.get('hop-external-file-changed')?.({
+      payload: { docId: '', path: '' },
+    });
+    expect(bridge.handleExternalFileChanged).not.toHaveBeenCalled();
+
+    const first = windowHandlers.get('hop-external-file-changed')?.({
+      payload: { docId: 'doc-1', path: 'C:\\docs\\doc.hwp', kind: 'modified' },
+    });
+    // While first is in flight, two more events arrive; only latest is queued
+    await windowHandlers.get('hop-external-file-changed')?.({
+      payload: { docId: 'doc-1', path: 'C:\\docs\\doc.hwp', kind: 'modified' },
+    });
+    await windowHandlers.get('hop-external-file-changed')?.({
+      payload: { docId: 'doc-1', path: 'C:\\docs\\doc.hwp', kind: 'deleted' },
+    });
+
+    expect(bridge.handleExternalFileChanged).toHaveBeenCalledTimes(1);
+
+    resolveFirst(null);
+    await first;
+
+    expect(bridge.handleExternalFileChanged).toHaveBeenCalledTimes(2);
+    expect(bridge.handleExternalFileChanged).toHaveBeenLastCalledWith({
+      docId: 'doc-1',
+      path: 'C:\\docs\\doc.hwp',
+      kind: 'deleted',
+    });
+    expect(setMessage).toHaveBeenCalledWith('원본 파일이 외부에서 삭제되었거나 이동되었습니다');
+  });
 });
 
 function installTauriMocks() {

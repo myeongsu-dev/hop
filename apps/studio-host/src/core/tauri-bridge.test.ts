@@ -5,6 +5,11 @@ import { TauriBridge } from './tauri-bridge';
 const passwordPrompt = vi.hoisted(() => vi.fn());
 vi.mock('@/upstream/ui', () => ({ showHwpPasswordDialog: passwordPrompt }));
 
+const externalChangeDialogMock = vi.hoisted(() => vi.fn());
+vi.mock('../ui/external-change-dialog', () => ({
+  openExternalChangeDialog: externalChangeDialogMock,
+}));
+
 const invokeMock = vi.hoisted(() => vi.fn());
 const saveMock = vi.hoisted(() => vi.fn());
 const openMock = vi.hoisted(() => vi.fn());
@@ -766,6 +771,288 @@ describe('TauriBridge', () => {
     expect(handle.write).toHaveBeenCalledWith(new Uint8Array([1, 2, 3]));
     expect(handle.close).toHaveBeenCalled();
     expect(removeMock).toHaveBeenCalledWith('/tmp/source.hwp.hop-save-deadbeef.tmp');
+  });
+
+  it('reloads clean documents on external change when user chooses reload', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-clean', dirty: false }));
+    externalChangeDialogMock.mockResolvedValue('reload');
+    fsOpenMock.mockResolvedValue(readHandle([9, 8, 7]));
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'prepare_document_open') return undefined;
+      if (command === 'open_document_tracking') {
+        return nativeOpenResult({ docId: 'doc-reloaded', fileName: 'source.hwp', sourcePath: '/tmp/source.hwp' });
+      }
+      if (command === 'start_file_watch') return undefined;
+      if (command === 'note_finder_recent_document') return undefined;
+      if (command === 'record_recent_document') return undefined;
+      if (command === 'close_document') return undefined;
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const loaded = await bridge.handleExternalFileChanged({
+      docId: 'doc-clean',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+
+    expect(externalChangeDialogMock).toHaveBeenCalledWith({
+      fileName: 'source.hwp',
+      path: '/tmp/source.hwp',
+      dirty: false,
+      kind: 'modified',
+    });
+    expect(messageMock).not.toHaveBeenCalled();
+    expect(loaded?.message).toBe('source.hwp — 2페이지');
+    expect(invokeMock).toHaveBeenCalledWith('start_file_watch', {
+      docId: 'doc-reloaded',
+      path: '/tmp/source.hwp',
+    });
+    expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'doc-clean' });
+  });
+
+  it('acknowledges external change without reloading when clean user chooses ignore', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-clean', dirty: false }));
+    externalChangeDialogMock.mockResolvedValue('ignore');
+    invokeMock.mockResolvedValue(undefined);
+
+    const loaded = await bridge.handleExternalFileChanged({
+      docId: 'doc-clean',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+
+    expect(loaded).toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith('acknowledge_external_change', { docId: 'doc-clean' });
+    expect(fsOpenMock).not.toHaveBeenCalled();
+  });
+
+  it('handles dirty 3-way choices: reload-discard, keep-mine, and save-copy-and-reload', async () => {
+    // 1) keep-mine preserves dirty state and still triggers save-time overwrite warning
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-dirty', dirty: true }));
+    externalChangeDialogMock.mockResolvedValueOnce('keep-mine');
+    invokeMock.mockResolvedValue(undefined);
+
+    const kept = await bridge.handleExternalFileChanged({
+      docId: 'doc-dirty',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+    expect(kept).toBeNull();
+    expect(externalChangeDialogMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ dirty: true, kind: 'modified' }),
+    );
+    expect(bridge.hasUnsavedChanges()).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith('acknowledge_external_change', { docId: 'doc-dirty' });
+
+    // 2) save-copy-and-reload saves copy via Save As and then reloads the original path
+    saveMock.mockResolvedValue('/tmp/my-copy.hwp');
+    const handle = writeHandle();
+    fsOpenMock
+      .mockResolvedValueOnce(handle)
+      .mockResolvedValueOnce(readHandle([7, 7, 7]));
+    externalChangeDialogMock.mockResolvedValueOnce('save-copy-and-reload');
+    invokeMock.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'check_external_modification') return { changed: false };
+      if (command === 'prepare_staged_hwp_save') return '/tmp/my-copy.hwp.tmp';
+      if (command === 'commit_staged_hwp_save') {
+        return {
+          docId: 'doc-dirty',
+          sourcePath: '/tmp/my-copy.hwp',
+          format: 'hwp',
+          revision: 2,
+          dirty: false,
+          warnings: [],
+        };
+      }
+      if (command === 'prepare_document_open') {
+        expect(args.path).toBe('/tmp/source.hwp');
+        return undefined;
+      }
+      if (command === 'open_document_tracking') {
+        expect(args.path).toBe('/tmp/source.hwp');
+        return nativeOpenResult({
+          docId: 'doc-original-reloaded',
+          fileName: 'source.hwp',
+          sourcePath: '/tmp/source.hwp',
+        });
+      }
+      if (
+        command === 'start_file_watch' ||
+        command === 'note_finder_recent_document' ||
+        command === 'record_recent_document' ||
+        command === 'close_document'
+      ) {
+        return undefined;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const reloaded = await bridge.handleExternalFileChanged({
+      docId: 'doc-dirty',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+    expect(reloaded?.message).toBe('source.hwp — 2페이지');
+    expect(bridge.hasUnsavedChanges()).toBe(false);
+  });
+
+  it('keeps edits if Save As is cancelled during save-copy-and-reload', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-dirty', dirty: true }));
+    externalChangeDialogMock.mockResolvedValue('save-copy-and-reload');
+    saveMock.mockResolvedValue(null);
+
+    const result = await bridge.handleExternalFileChanged({
+      docId: 'doc-dirty',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+
+    expect(result).toBeNull();
+    expect(bridge.hasUnsavedChanges()).toBe(true);
+    expect(fsOpenMock).not.toHaveBeenCalled();
+  });
+
+  it('acknowledges deleted external files without crashing or reloading', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-del', dirty: false }));
+    externalChangeDialogMock.mockResolvedValue('acknowledge-deleted');
+    invokeMock.mockResolvedValue(undefined);
+
+    const result = await bridge.handleExternalFileChanged({
+      docId: 'doc-del',
+      path: '/tmp/source.hwp',
+      kind: 'deleted',
+    });
+
+    expect(result).toBeNull();
+    expect(externalChangeDialogMock).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'deleted' }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith('acknowledge_external_change', { docId: 'doc-del' });
+    expect(fsOpenMock).not.toHaveBeenCalled();
+  });
+
+  it('suppresses duplicate dialog and ignores stale docId events', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-1', dirty: false }));
+
+    // Stale docId is ignored immediately
+    expect(
+      await bridge.handleExternalFileChanged({
+        docId: 'doc-other',
+        path: '/tmp/other.hwp',
+        kind: 'modified',
+      }),
+    ).toBeNull();
+    expect(externalChangeDialogMock).not.toHaveBeenCalled();
+
+    // Concurrent duplicate while dialog is open only opens dialog once until resolved
+    let resolveFirst!: (decision: string) => void;
+    externalChangeDialogMock
+      .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('ignore');
+    invokeMock.mockResolvedValue(undefined);
+
+    const first = bridge.handleExternalFileChanged({
+      docId: 'doc-1',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+    const second = bridge.handleExternalFileChanged({
+      docId: 'doc-1',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+
+    expect(await second).toBeNull();
+    expect(externalChangeDialogMock).toHaveBeenCalledTimes(1);
+
+    resolveFirst('ignore');
+    await first;
+    expect(externalChangeDialogMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reloads and discards unsaved edits when dirty user chooses reload-discard', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-dirty', dirty: true }));
+    externalChangeDialogMock.mockResolvedValue('reload-discard');
+    fsOpenMock.mockResolvedValue(readHandle([4, 5, 6]));
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'prepare_document_open') return undefined;
+      if (command === 'open_document_tracking') {
+        return nativeOpenResult({
+          docId: 'doc-discarded-reloaded',
+          fileName: 'source.hwp',
+          sourcePath: '/tmp/source.hwp',
+          dirty: false,
+        });
+      }
+      if (
+        command === 'start_file_watch' ||
+        command === 'note_finder_recent_document' ||
+        command === 'record_recent_document' ||
+        command === 'close_document'
+      ) {
+        return undefined;
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const reloaded = await bridge.handleExternalFileChanged({
+      docId: 'doc-dirty',
+      path: '/tmp/source.hwp',
+      kind: 'modified',
+    });
+
+    expect(messageMock).not.toHaveBeenCalled();
+    expect(reloaded?.message).toBe('source.hwp — 2페이지');
+    expect(bridge.hasUnsavedChanges()).toBe(false);
+    expect(invokeMock).toHaveBeenCalledWith('close_document', { docId: 'doc-dirty' });
+  });
+
+  it('preserves save-time external overwrite warning after ignoring or keeping edits', async () => {
+    const bridge = new TauriBridge();
+    applyOpenResult(bridge, nativeOpenResult({ docId: 'doc-dirty', dirty: true }));
+    externalChangeDialogMock.mockResolvedValue('keep-mine');
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'acknowledge_external_change') return undefined;
+      if (command === 'check_external_modification') {
+        return {
+          changed: true,
+          sourcePath: '/tmp/source.hwp',
+          reason: 'external modification',
+        };
+      }
+      if (command === 'commit_staged_hwp_save') {
+        throw new Error('commit should not run when overwrite warning is cancelled');
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    await expect(
+      bridge.handleExternalFileChanged({
+        docId: 'doc-dirty',
+        path: '/tmp/source.hwp',
+        kind: 'modified',
+      }),
+    ).resolves.toBeNull();
+
+    messageMock.mockResolvedValue('저장 취소');
+    const saveResult = await bridge.saveDocumentFromCommand();
+
+    expect(saveResult).toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith('check_external_modification', {
+      docId: 'doc-dirty',
+      targetPath: '/tmp/source.hwp',
+    });
+    expect(messageMock).toHaveBeenCalledWith(
+      expect.stringContaining('원본 파일이 HOP 밖에서 변경되었습니다.'),
+      expect.objectContaining({ title: '외부 변경 감지', kind: 'warning' }),
+    );
   });
 });
 
