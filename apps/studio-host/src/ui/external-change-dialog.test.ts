@@ -55,6 +55,7 @@ class FakeElement {
 
 class FakeDocument {
   body = new FakeElement();
+  activeElement: FakeElement | null = null;
   private listeners = new Map<string, EventListener[]>();
 
   createElement(): FakeElement {
@@ -186,5 +187,26 @@ describe('openExternalChangeDialog', () => {
 
     buttons[0]!.click();
     await expect(promise).resolves.toBe('acknowledge-deleted');
+  });
+
+  it('returns focus to the element that had it (the editor) after closing', async () => {
+    const editor = new FakeElement();
+    fakeDocument.activeElement = editor;
+
+    const promise = openExternalChangeDialog({
+      fileName: 'doc.hwp',
+      path: 'C:\\docs\\doc.hwp',
+      dirty: true,
+      kind: 'modified',
+    });
+    editor.focused = false; // dialog button took focus
+
+    const keepMine = collectButtons(fakeDocument.body.children[0]!).find(
+      (b) => b.dataset.decision === 'keep-mine',
+    )!;
+    keepMine.click();
+
+    await expect(promise).resolves.toBe('keep-mine');
+    expect(editor.focused).toBe(true);
   });
 });

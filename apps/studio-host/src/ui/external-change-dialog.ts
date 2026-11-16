@@ -19,6 +19,11 @@ export function openExternalChangeDialog(
   options: ExternalChangeDialogOptions,
 ): Promise<ExternalChangeDecision> {
   return new Promise((resolve) => {
+    // The change usually arrives while the user is typing in the editor; give focus back on close
+    // so typing and shortcuts like Ctrl+S keep working without an extra click.
+    const active = document.activeElement as HTMLElement | null;
+    const previouslyFocused = typeof active?.focus === 'function' ? active : null;
+
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
 
@@ -74,6 +79,9 @@ export function openExternalChangeDialog(
     const close = (decision: ExternalChangeDecision) => {
       document.removeEventListener('keydown', onKeyDown, true);
       overlay.remove();
+      if (previouslyFocused && previouslyFocused.isConnected !== false) {
+        previouslyFocused.focus({ preventScroll: true });
+      }
       resolve(decision);
     };
 
